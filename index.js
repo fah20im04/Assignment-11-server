@@ -168,6 +168,30 @@ async function run() {
         res.status(500).send({ message: "Internal server error" });
       }
     });
+    // my issue related api
+    
+    app.get("/issues/my-issues/:email", async (req, res) => {
+      try {
+        const email = req.params.email;
+
+        
+        const issues = await issuesCollection
+          .find({ userEmail: email })
+          .sort({ createdAt: -1 }) 
+          .toArray();
+
+        res.status(200).send(issues);
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
+    
+
+
+
+    // end
   } catch (err) {
     console.error(err);
   }
