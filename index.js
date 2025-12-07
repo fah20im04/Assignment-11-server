@@ -189,6 +189,27 @@ async function run() {
       }
     });
 
+    app.get("/issues/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid issue ID" });
+        }
+
+        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!issue) {
+          return res.status(404).send({ message: "Issue not found" });
+        }
+
+        res.send(issue);
+      } catch (err) {
+        console.error("Error fetching issue:", err);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
+
     // PATCH /issues/update/:id
     // app.patch("/issues/update/:id", async (req, res) => {
     //   try {
