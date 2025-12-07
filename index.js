@@ -89,7 +89,7 @@ async function run() {
 
     const db = client.db("public_Infrastructure_user");
     const usersCollection = db.collection("users");
-    const issueCollection = db.collection("issues");
+    const issuesCollection = db.collection("issues");
 
     // =========================
     //  GET USERS (Protected)
