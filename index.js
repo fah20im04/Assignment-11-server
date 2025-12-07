@@ -5,7 +5,7 @@
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 
 const app = express();
@@ -137,8 +137,7 @@ async function run() {
     //=========================
     //issues related api
     //=========================
-
-    app.post("/issues", async (req, res) => {
+    app.post("/issues", verifyFbToken, async (req, res) => {
       try {
         const issue = req.body;
 
@@ -146,6 +145,9 @@ async function run() {
         issue.status = "Pending";
         issue.priority = "Normal";
         issue.upvotes = 0;
+
+        // Attach the user's email
+        issue.userEmail = req.decoded_email;
 
         const result = await issuesCollection.insertOne(issue);
 
@@ -168,16 +170,16 @@ async function run() {
         res.status(500).send({ message: "Internal server error" });
       }
     });
+
     // my issue related api
-    
+
     app.get("/issues/my-issues/:email", async (req, res) => {
       try {
         const email = req.params.email;
 
-        
         const issues = await issuesCollection
           .find({ userEmail: email })
-          .sort({ createdAt: -1 }) 
+          .sort({ createdAt: -1 })
           .toArray();
 
         res.status(200).send(issues);
@@ -187,9 +189,57 @@ async function run() {
       }
     });
 
-    
+    // PATCH /issues/update/:id
+    // app.patch("/issues/update/:id", async (req, res) => {
+    //   try {
+    //     const id = req.params.id;
+    //     const updates = req.body;
 
+    //     // Get existing issue
+    //     const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
 
+    //     if (!issue) return res.status(404).send({ message: "Issue not found" });
+
+    //     if (issue.status !== "Pending")
+    //       return res
+    //         .status(400)
+    //         .send({ message: "Only pending issues can be edited" });
+
+    //     // Update allowed fields
+    //     const updatedIssue = await issuesCollection.updateOne(
+    //       { _id: new ObjectId(id) },
+    //       { $set: updates }
+    //     );
+
+    //     res.status(200).send({ message: "Issue updated successfully" });
+    //   } catch (err) {
+    //     console.error(err);
+    //     res.status(500).send({ message: "Internal server error" });
+    //   }
+    // });
+
+    // DELETE /issues/:id
+    app.delete("/issues/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!issue) return res.status(404).send({ message: "Issue not found" });
+
+        if (issue.status !== "Pending")
+          return res
+            .status(400)
+            .send({ message: "Only pending issues can be deleted" });
+
+        await issuesCollection.deleteOne({ _id: new ObjectId(id) });
+
+        res.status(200).send({ message: "Issue deleted successfully" });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
 
     // end
   } catch (err) {
