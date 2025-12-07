@@ -142,13 +142,11 @@ async function run() {
       try {
         const issue = req.body;
 
-        // default values
         issue.createdAt = new Date();
         issue.status = "Pending";
         issue.priority = "Normal";
         issue.upvotes = 0;
 
-        // Insert into DB
         const result = await issuesCollection.insertOne(issue);
 
         res.status(201).send({
