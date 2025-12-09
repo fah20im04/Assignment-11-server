@@ -8,6 +8,8 @@ const admin = require("firebase-admin");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 
+const stripe = require("stripe")(process.env.STRIPE_SECRET);
+
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -90,6 +92,7 @@ async function run() {
     const db = client.db("public_Infrastructure_user");
     const usersCollection = db.collection("users");
     const issuesCollection = db.collection("issues");
+    const paymentsCollection = db.collection("payments");
 
     // =========================
     //  GET USERS (Protected)
@@ -137,7 +140,7 @@ async function run() {
     //=========================
     //issues related api
     //=========================
-    app.post("/issues", verifyFbToken, async (req, res) => {
+    app.post("/issues", async (req, res) => {
       try {
         const issue = req.body;
 
@@ -239,6 +242,57 @@ async function run() {
     //   }
     // });
 
+    // Upvote issue (Only once per user)
+    // =========================
+    //  UPVOTE ISSUE (Protected)
+    // =========================
+    app.patch("/issues/upvote/:id", async (req, res) => {
+      try {
+        const issueId = req.params.id;
+        const userEmail = req.decoded_email;
+
+        const issue = await issuesCollection.findOne({
+          _id: new ObjectId(issueId),
+        });
+        if (!issue) {
+          return res.status(404).send({ message: "Issue not found" });
+        }
+
+        // User cannot upvote own issue
+        if (issue.userEmail === userEmail) {
+          return res
+            .status(400)
+            .send({ message: "You cannot upvote your own issue" });
+        }
+
+        // Prevent duplicate upvotes
+        const hasVoted = await issuesCollection.findOne({
+          _id: new ObjectId(issueId),
+          upvotedUsers: userEmail,
+        });
+
+        if (hasVoted) {
+          return res
+            .status(400)
+            .send({ message: "You have already upvoted this issue" });
+        }
+
+        // Add upvote
+        await issuesCollection.updateOne(
+          { _id: new ObjectId(issueId) },
+          {
+            $inc: { upvotes: 1 },
+            $push: { upvotedUsers: userEmail },
+          }
+        );
+
+        res.status(200).send({ message: "Upvoted successfully" });
+      } catch (err) {
+        console.log(err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
     // DELETE /issues/:id
     app.delete("/issues/:id", async (req, res) => {
       try {
@@ -259,6 +313,105 @@ async function run() {
       } catch (err) {
         console.error(err);
         res.status(500).send({ message: "Internal server error" });
+      }
+    });
+    //===========================================
+    //payment related api
+    //===========================================
+
+    app.get("/boost-success", async (req, res) => {
+      try {
+        const sessionId = req.query.session_id;
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        const issueId = session.metadata.issueId;
+        const title = session.metadata.title;
+        const email = session.customer_email;
+
+        // Update issue priority to "High"
+        await issuesCollection.updateOne(
+          { _id: new ObjectId(issueId) },
+          {
+            $set: { priority: "High" },
+            $push: {
+              timeline: {
+                action: "Issue boosted",
+                date: new Date(),
+                by: email,
+              },
+            },
+          }
+        );
+
+        // payment into payments collection 
+        await paymentsCollection.insertOne({
+          issueId,
+          title,
+          email,
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          paymentStatus: session.payment_status,
+          transactionId: session.id,
+          createdAt: new Date(),
+        });
+
+       
+        res.send({
+          message: "Payment Success — Issue Boosted",
+          issueId,
+          email,
+          status: "success",
+        });
+      } catch (err) {
+        console.error(err);
+        res
+          .status(500)
+          .send({ message: "Boost success failed", error: err.message });
+      }
+    });
+
+    app.post("/create-boost-session", verifyFbToken, async (req, res) => {
+      try {
+        const { issueId, cost, title, userEmail } = req.body;
+
+        if (!issueId || !cost || !title || !userEmail) {
+          return res.status(400).json({ message: "Missing required fields" });
+        }
+
+        if (userEmail !== req.decoded_email) {
+          return res.status(403).json({ message: "Forbidden access" });
+        }
+
+        const session = await stripe.checkout.sessions.create({
+          line_items: [
+            {
+              price_data: {
+                currency: "usd",
+                unit_amount: parseInt(cost) * 100,
+                product_data: {
+                  name: `Boost Issue: ${title}`,
+                },
+              },
+              quantity: 1,
+            },
+          ],
+          mode: "payment",
+          metadata: {
+            issueId,
+            title,
+          },
+          customer_email: userEmail,
+          success_url: `${process.env.SITE_DOMAIN}/boost-success?session_id={CHECKOUT_SESSION_ID}&issueId=${issueId}`,
+          cancel_url: `${process.env.SITE_DOMAIN}/issue/${issueId}`,
+        });
+
+        res.json({ url: session.url });
+      } catch (err) {
+        console.error("Stripe Boost Error:", err);
+        res
+          .status(500)
+          .json({ message: "Stripe session failed", error: err.message });
       }
     });
 
