@@ -130,6 +130,7 @@ async function run() {
     // GET USERS (protected) - returns up to 5 users, optional search
     // ------------------------
     app.get("/users", async (req, res) => {
+      console.log("decoded email", req.decoded_email);
       try {
         const searchText = req.query.searchText;
         const query = {};
@@ -149,12 +150,25 @@ async function run() {
       }
     });
 
+    app.get("/users/:email/role", verifyFbToken, async (req, res) => {
+      try {
+        const email = req.params.email;
+        const user = await usersCollection.findOne({ email });
+        if (!user) return res.status(404).send({ role: "citizen" });
+        res.send(user); // <-- You are sending the whole user object, not just { role: ... }
+      } catch (err) {
+        res.status(500).send({ role: "citizen" });
+      }
+    });
+
     // ------------------------
     // CREATE USER (unprotected)
     // ------------------------
     app.post("/users", async (req, res) => {
       try {
-        const user = req.body;
+        const user = req.decoded_email;
+
+        user.role = "citizen";
         user.createdAt = new Date();
 
         const existing = await usersCollection.findOne({ email: user.email });
@@ -170,6 +184,50 @@ async function run() {
         });
       } catch (e) {
         console.error("POST /users error:", e);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
+    //===================
+    // DashBoars related api
+    //========================
+    // GET /dashboard/citizen/:email
+    app.get("/dashboard/citizen/:email", verifyFbToken, async (req, res) => {
+      try {
+        const email = req.decoded_email; 
+
+        const totalIssues = await issuesCollection.countDocuments({
+          userEmail: email,
+        });
+        const pending = await issuesCollection.countDocuments({
+          userEmail: email,
+          status: "Pending",
+        });
+        const inProgress = await issuesCollection.countDocuments({
+          userEmail: email,
+          status: "In-Progress",
+        });
+        const resolved = await issuesCollection.countDocuments({
+          userEmail: email,
+          status: "Resolved",
+        });
+
+        const totalPayments = await paymentsCollection
+          .aggregate([
+            { $match: { email } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
+          ])
+          .toArray();
+
+        res.send({
+          totalIssues,
+          pending,
+          inProgress,
+          resolved,
+          totalPayments: totalPayments[0]?.total || 0,
+        });
+      } catch (err) {
+        console.error("GET /dashboard/citizen/:email error:", err);
         res.status(500).send({ message: "Internal server error" });
       }
     });
@@ -276,7 +334,7 @@ async function run() {
     //-----------------------------------
     app.post("/subscribe", async (req, res) => {
       try {
-        const email = req.decoded_email;
+        const email = req.body.email;
         const user = await usersCollection.findOne({ email });
         if (!user) return res.status(404).send({ message: "User not found" });
 
@@ -286,7 +344,7 @@ async function run() {
             {
               price_data: {
                 currency: "usd",
-                unit_amount: 1000 * 100, // 1000tk
+                unit_amount: 1000 * 100,
                 product_data: { name: "Premium Subscription" },
               },
               quantity: 1,
@@ -294,7 +352,7 @@ async function run() {
           ],
           mode: "payment",
           customer_email: email,
-          success_url: `${process.env.SITE_DOMAIN}/profile?session_id={CHECKOUT_SESSION_ID}`,
+          success_url: `${process.env.SITE_DOMAIN}/subscribe-success?session_id={CHECKOUT_SESSION_ID}`,
           cancel_url: `${process.env.SITE_DOMAIN}/profile`,
         });
 
@@ -335,15 +393,21 @@ async function run() {
     // CREATE ISSUE (protected)
     // - initializes timeline with "Issue reported by citizen"
     // ------------------------
-    app.post("/issues", async (req, res) => {
+    // Make sure to include the verifyFbToken middleware
+    app.post("/issues", verifyFbToken, async (req, res) => {
       try {
         const issue = req.body;
 
+        // Set default fields
         issue.createdAt = new Date();
         issue.status = "Pending";
         issue.priority = "Normal";
         issue.upvotes = 0;
+
+        // Use decoded_email from Firebase token
         issue.userEmail = req.decoded_email;
+
+        // Initialize timeline
         issue.timeline = [
           {
             status: "Pending",
@@ -354,7 +418,10 @@ async function run() {
           },
         ];
 
+        console.log("Issue reporter email:", req.decoded_email);
+
         const result = await issuesCollection.insertOne(issue);
+
         res.status(201).send({
           message: "Issue created successfully",
           insertedId: result.insertedId,
@@ -582,7 +649,7 @@ async function run() {
     // ------------------------
     // DELETE ISSUE (protected)
     // ------------------------
-    app.delete("/issues/:id", async (req, res) => {
+    app.delete("/issues/:id", verifyFbToken, async (req, res) => {
       try {
         const id = req.params.id;
         if (!ObjectId.isValid(id))
