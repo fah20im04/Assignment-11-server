@@ -1,6 +1,7 @@
 // server.js
 // =========================
 //  BACKEND SERVER (fixed + commented)
+//  TIMELINE DUPLICATES FIXED: manual $push -> addTimelineEntry()
 // =========================
 
 const express = require("express");
@@ -100,6 +101,26 @@ async function run() {
     // - Use this whenever you need to append a timeline item to an issue.
     // - Keeps timeline entry shape consistent.
     // ------------------------
+
+    // inside run() so usersCollection is in scope
+    async function verifyAdmin(req, res, next) {
+      try {
+        if (!req.decoded_email) {
+          return res.status(401).send({ message: "Unauthorized" });
+        }
+        const adminUser = await usersCollection.findOne({
+          email: req.decoded_email,
+        });
+        if (!adminUser || adminUser.role !== "admin") {
+          return res.status(403).send({ message: "Forbidden: admin only" });
+        }
+        next();
+      } catch (err) {
+        console.error("verifyAdmin error:", err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    }
+
     async function addTimelineEntry(issueId, entry) {
       // entry: { status, message, updatedBy, role }
       if (!ObjectId.isValid(issueId)) throw new Error("Invalid issueId");
@@ -194,7 +215,7 @@ async function run() {
     // GET /dashboard/citizen/:email
     app.get("/dashboard/citizen/:email", verifyFbToken, async (req, res) => {
       try {
-        const email = req.decoded_email; 
+        const email = req.decoded_email;
 
         const totalIssues = await issuesCollection.countDocuments({
           userEmail: email,
@@ -328,7 +349,237 @@ async function run() {
         res.status(500).send({ message: "Internal server error" });
       }
     });
+    //==========================
+    //admin related api
+    //===========================
+    app.get("/admin/stats", verifyFbToken, verifyAdmin, async (req, res) => {
+      try {
+        const totalIssues = await issuesCollection.countDocuments();
+        const resolved = await issuesCollection.countDocuments({
+          status: "Resolved",
+        });
+        const pending = await issuesCollection.countDocuments({
+          status: "Pending",
+        });
+        const rejected = await issuesCollection.countDocuments({
+          status: "Closed",
+        }); // or use a rejected flag
+        const paymentsAgg = await paymentsCollection
+          .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+          .toArray();
+        const totalPayments = paymentsAgg[0]?.total || 0;
 
+        // latest few items
+        const latestIssues = await issuesCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .limit(6)
+          .toArray();
+        const latestPayments = await paymentsCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .limit(6)
+          .toArray();
+        const latestUsers = await usersCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .limit(6)
+          .toArray();
+
+        res.send({
+          totalIssues,
+          resolved,
+          pending,
+          rejected,
+          totalPayments,
+          latestIssues,
+          latestPayments,
+          latestUsers,
+        });
+      } catch (err) {
+        console.error("GET /admin/stats error:", err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
+    app.get("/admin/issues", verifyFbToken, verifyAdmin, async (req, res) => {
+      try {
+        const page = parseInt(req.query.page || "1", 10);
+        const limit = parseInt(req.query.limit || "20", 10);
+        const skip = (page - 1) * limit;
+
+        // boosted (priority: "High") first, then others, sort by createdAt desc
+        const cursor = issuesCollection
+          .find()
+          .sort({ priority: -1, createdAt: -1 })
+          .skip(skip)
+          .limit(limit);
+        const issues = await cursor.toArray();
+        const total = await issuesCollection.countDocuments();
+
+        res.send({ issues, total, page, limit });
+      } catch (err) {
+        console.error("GET /admin/issues error:", err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
+    app.post(
+      "/admin/issues/:id/assign",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const issueId = req.params.id;
+          const { staffEmail, staffName } = req.body;
+          if (!ObjectId.isValid(issueId))
+            return res.status(400).send({ message: "Invalid issue id" });
+          if (!staffEmail)
+            return res.status(400).send({ message: "Missing staffEmail" });
+
+          const issue = await issuesCollection.findOne({
+            _id: new ObjectId(issueId),
+          });
+          if (!issue)
+            return res.status(404).send({ message: "Issue not found" });
+          if (issue.assignedTo)
+            return res.status(400).send({ message: "Already assigned" });
+
+          // update assignedTo only (status moved below)
+          await issuesCollection.updateOne(
+            { _id: new ObjectId(issueId) },
+            {
+              $set: {
+                assignedTo: { email: staffEmail, name: staffName || null },
+                status: "In-Progress",
+              },
+            }
+          );
+
+          // timeline entry — use helper now (no direct $push)
+          const timelineItem = {
+            status: "In-Progress",
+            message: `Issue assigned to Staff: ${staffName || staffEmail}`,
+            updatedBy: req.decoded_email,
+            role: "Admin",
+          };
+
+          await addTimelineEntry(issueId, timelineItem);
+
+          res.send({ message: "Staff assigned" });
+        } catch (err) {
+          console.error("POST /admin/issues/:id/assign error:", err);
+          res.status(500).send({ message: "Internal server error" });
+        }
+      }
+    );
+
+    app.post(
+      "/admin/issues/:id/reject",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const issueId = req.params.id;
+          const { reason } = req.body;
+          const issue = await issuesCollection.findOne({
+            _id: new ObjectId(issueId),
+          });
+          if (!issue)
+            return res.status(404).send({ message: "Issue not found" });
+          if (issue.status !== "Pending")
+            return res
+              .status(400)
+              .send({ message: "Only pending issues can be rejected" });
+
+          await issuesCollection.updateOne(
+            { _id: new ObjectId(issueId) },
+            { $set: { status: "Closed" } }
+          );
+
+          const timelineItem = {
+            status: "Closed",
+            message: `Issue rejected by admin. Reason: ${
+              reason || "Not specified"
+            }`,
+            updatedBy: req.decoded_email,
+            role: "Admin",
+          };
+
+          // use helper (removed direct $push)
+          await addTimelineEntry(issueId, timelineItem);
+
+          res.send({ message: "Issue rejected" });
+        } catch (err) {
+          console.error("POST /admin/issues/:id/reject error:", err);
+          res.status(500).send({ message: "Internal server error" });
+        }
+      }
+    );
+
+    app.get("/admin/users", verifyFbToken, verifyAdmin, async (req, res) => {
+      try {
+        const users = await usersCollection
+          .find({ role: { $ne: "admin" } })
+          .toArray();
+        res.send(users);
+      } catch (err) {
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
+    app.patch(
+      "/admin/users/:email/block",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const email = req.params.email;
+          const { block } = req.body; // { block: true } or false
+          const result = await usersCollection.updateOne(
+            { email },
+            { $set: { isBlocked: !!block } }
+          );
+          res.send({ modified: result.modifiedCount ? true : false });
+        } catch (err) {
+          res.status(500).send({ message: "Internal server error" });
+        }
+      }
+    );
+
+    app.post("/admin/staff", verifyFbToken, verifyAdmin, async (req, res) => {
+      try {
+        const { email, displayName, phone, photoURL, password } = req.body;
+        if (!email || !password)
+          return res.status(400).send({ message: "Missing fields" });
+
+        // 1) create in Firebase (admin SDK)
+        const firebaseUser = await admin.auth().createUser({
+          email,
+          password,
+          displayName,
+          photoURL,
+        });
+
+        // 2) add in DB with role staff
+        const staffDoc = {
+          email,
+          displayName,
+          phone,
+          photoURL,
+          role: "staff",
+          createdAt: new Date(),
+        };
+        await usersCollection.insertOne(staffDoc);
+
+        res.send({ message: "Staff created", uid: firebaseUser.uid });
+      } catch (err) {
+        console.error("POST /admin/staff error:", err);
+        res
+          .status(500)
+          .send({ message: "Internal server error", error: err.message });
+      }
+    });
     //-----------------------------------
     //subscription related api
     //-----------------------------------
@@ -735,7 +986,7 @@ async function run() {
     // BOOST SUCCESS (public)
     // Stripe will redirect the user to this endpoint (via success_url).
     // We read the session, update issue priority, insert a payment record,
-    // and append a timeline entry.
+    // and append a timeline entry (via helper — no duplicate push).
     app.get("/boost-success", async (req, res) => {
       try {
         const sessionId = req.query.session_id;
@@ -758,21 +1009,11 @@ async function run() {
         if (!ObjectId.isValid(issueId))
           return res.status(400).send({ message: "Invalid issueId" });
 
-        // 1) Update issue priority and append a timeline entry (using updateOne push)
+        // 1) Update issue priority (no direct timeline push here)
         await issuesCollection.updateOne(
           { _id: new ObjectId(issueId) },
           {
             $set: { priority: "High" },
-            $push: {
-              // keep this push consistent with other timeline shape OR use addTimelineEntry helper
-              timeline: {
-                status: null,
-                message: "Issue boosted by payment",
-                updatedBy: email,
-                role: "Citizen",
-                date: new Date(),
-              },
-            },
           }
         );
 
@@ -788,13 +1029,13 @@ async function run() {
           createdAt: new Date(),
         });
 
-        // 3) Also append a timeline entry via helper (optional, duplicates the above push)
-        // await addTimelineEntry(issueId, {
-        //   status: null,
-        //   message: "Issue boosted by payment",
-        //   updatedBy: email,
-        //   role: "Citizen",
-        // });
+        // 3) Append a timeline entry via helper (single source of truth)
+        await addTimelineEntry(issueId, {
+          status: null,
+          message: "Issue boosted by payment",
+          updatedBy: email,
+          role: "Citizen",
+        });
 
         res.send({
           message: "Payment Success — Issue Boosted",
