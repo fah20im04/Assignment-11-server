@@ -1,12 +1,10 @@
-// server.js
-// =========================
-//  BACKEND SERVER (fixed + commented)
-//  TIMELINE DUPLICATES FIXED: manual $push -> addTimelineEntry()
-// =========================
+//  BACKEND SERVER
 
+const { getAuth } = require("firebase-admin/auth");
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
+
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 require("dotenv").config();
 
@@ -19,12 +17,13 @@ const port = process.env.PORT || 3000;
 // =========================
 //  FIREBASE ADMIN INIT
 // =========================
-// Make sure the JSON file path is correct and the file exists.
+
 const serviceAccount = require("./civicconnet-firebase-adminsdk-fbsvc-9c71a80474.json");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
+
 console.log("Firebase Admin Initialized");
 
 // =========================
@@ -35,7 +34,7 @@ const FRONTEND_ORIGIN = process.env.SITE_DOMAIN || "http://localhost:5173";
 
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: FRONTEND_ORIGIN,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -47,23 +46,30 @@ app.use(express.json());
 // =========================
 //  VERIFY FIREBASE TOKEN MIDDLEWARE
 // =========================
+// const admin = require("firebase-admin");
+
 const verifyFbToken = async (req, res, next) => {
-  console.log("ALL HEADERS:", req.headers);
+  const authHeader = req.headers.authorization;
 
-  const auth = req.headers.authorization;
-  console.log("Authorization header:", auth);
-
-  if (!auth) {
-    return res.status(401).send({ message: "Unauthorized access" });
+  if (!authHeader?.startsWith("Bearer ")) {
+    console.log("❌ Missing Authorization header");
+    return res.status(401).send({ message: "Unauthorized" });
   }
 
+  const token = authHeader.split(" ")[1];
+
   try {
-    const token = auth.split(" ")[1];
     const decoded = await admin.auth().verifyIdToken(token);
+
     req.decoded_email = decoded.email;
+    req.user = decoded;
+
+    console.log("✅ Token verified — email:", decoded.email);
+
     next();
   } catch (error) {
-    return res.status(401).send({ message: "Unauthorized token" });
+    console.log("❌ Token verification failed:", error.message);
+    return res.status(401).send({ message: "Invalid Token" });
   }
 };
 
@@ -94,15 +100,10 @@ async function run() {
     const db = client.db("public_Infrastructure_user");
     const usersCollection = db.collection("users");
     const issuesCollection = db.collection("issues");
-    const paymentsCollection = db.collection("payments"); // NEW payments collection
+    const paymentsCollection = db.collection("payments"); 
+    const staffCollection = db.collection("staff"); 
 
-    // ------------------------
-    // Helper: addTimelineEntry
-    // - Use this whenever you need to append a timeline item to an issue.
-    // - Keeps timeline entry shape consistent.
-    // ------------------------
 
-    // inside run() so usersCollection is in scope
     async function verifyAdmin(req, res, next) {
       try {
         if (!req.decoded_email) {
@@ -141,6 +142,29 @@ async function run() {
     // ------------------------
     // ROUTES
     // ------------------------
+    // token api
+    app.post("/set-token", async (req, res) => {
+      try {
+        const authHeader = req.headers.authorization;
+
+        if (!authHeader) return res.status(401).send("Missing Authorization");
+
+        const token = authHeader.split(" ")[1];
+
+        if (!token) return res.status(401).send("Invalid token");
+
+        res.cookie("fbToken", token, {
+          httpOnly: true,
+          secure: false, // true in production
+          sameSite: "lax",
+          maxAge: 1000 * 60 * 60 * 24,
+        });
+
+        res.send({ message: "Token cookie set" });
+      } catch (err) {
+        res.status(500).send("Failed to set cookie");
+      }
+    });
 
     // BASE health check
     app.get("/", (req, res) => {
@@ -174,9 +198,11 @@ async function run() {
     app.get("/users/:email/role", verifyFbToken, async (req, res) => {
       try {
         const email = req.params.email;
-        const user = await usersCollection.findOne({ email });
+        const user = await usersCollection.findOne({
+          email: { $regex: `^${email}$`, $options: "i" },
+        });
         if (!user) return res.status(404).send({ role: "citizen" });
-        res.send(user); // <-- You are sending the whole user object, not just { role: ... }
+        res.send({ role: user.role || "citizen" });
       } catch (err) {
         res.status(500).send({ role: "citizen" });
       }
@@ -187,7 +213,7 @@ async function run() {
     // ------------------------
     app.post("/users", async (req, res) => {
       try {
-        const user = req.decoded_email;
+        const user = req.body;
 
         user.role = "citizen";
         user.createdAt = new Date();
@@ -213,9 +239,9 @@ async function run() {
     // DashBoars related api
     //========================
     // GET /dashboard/citizen/:email
-    app.get("/dashboard/citizen/:email", verifyFbToken, async (req, res) => {
+    app.get("/dashboard/citizen/:email", async (req, res) => {
       try {
-        const email = req.decoded_email;
+        const email = req.body;
 
         const totalIssues = await issuesCollection.countDocuments({
           userEmail: email,
@@ -252,7 +278,6 @@ async function run() {
         res.status(500).send({ message: "Internal server error" });
       }
     });
-
     // =========================
     // Get logged-in user's profile
     // =========================
@@ -324,9 +349,9 @@ async function run() {
     // =========================
     // Update logged-in user's profile (name, other info)
     // =========================
-    app.patch("/profile", async (req, res) => {
+    app.patch("/profile", verifyFbToken, async (req, res) => {
       try {
-        const email = req.body.email; // ← FIXED
+        const email = req.decoded_email;
         const updates = req.body;
 
         if (!email) {
@@ -352,7 +377,7 @@ async function run() {
     //==========================
     //admin related api
     //===========================
-    app.get("/admin/stats", verifyFbToken, verifyAdmin, async (req, res) => {
+    app.get("/admin/stats", async (req, res) => {
       try {
         const totalIssues = await issuesCollection.countDocuments();
         const resolved = await issuesCollection.countDocuments({
@@ -402,7 +427,7 @@ async function run() {
       }
     });
 
-    app.get("/admin/issues", verifyFbToken, verifyAdmin, async (req, res) => {
+    app.get("/admin/issues", verifyFbToken, async (req, res) => {
       try {
         const page = parseInt(req.query.page || "1", 10);
         const limit = parseInt(req.query.limit || "20", 10);
@@ -547,87 +572,128 @@ async function run() {
       }
     );
 
-    app.post("/admin/staff", verifyFbToken, verifyAdmin, async (req, res) => {
-      try {
-        const { email, displayName, phone, photoURL, password } = req.body;
-        if (!email || !password)
-          return res.status(400).send({ message: "Missing fields" });
+    // app.post("/subscribe", verifyFbToken, async (req, res) => {
 
-        // 1) create in Firebase (admin SDK)
-        const firebaseUser = await admin.auth().createUser({
-          email,
-          password,
-          displayName,
-          photoURL,
-        });
+    //   const email = req.decoded_email;
+    //   console.log("subscribe email", req.decoded_email);
 
-        // 2) add in DB with role staff
-        const staffDoc = {
-          email,
-          displayName,
-          phone,
-          photoURL,
-          role: "staff",
-          createdAt: new Date(),
-        };
-        await usersCollection.insertOne(staffDoc);
+    //   if (!email) {
+    //     return res.status(400).send({ message: "Email missing" });
+    //   }
 
-        res.send({ message: "Staff created", uid: firebaseUser.uid });
-      } catch (err) {
-        console.error("POST /admin/staff error:", err);
-        res
-          .status(500)
-          .send({ message: "Internal server error", error: err.message });
+    //   const user = await usersCollection.findOne({ email });
+    //   if (!user) return res.status(404).send({ message: "User not found" });
+
+    //   const session = await stripe.checkout.sessions.create({
+    //     payment_method_types: ["card"],
+    //     mode: "payment",
+    //     line_items: [
+    //       {
+    //         price_data: {
+    //           currency: "usd",
+    //           unit_amount: 1000, // $10
+    //           product_data: { name: "Premium Subscription" },
+    //         },
+    //         quantity: 1,
+    //       },
+    //     ],
+    //     customer_email: email,
+    //     success_url: `${process.env.SITE_DOMAIN}/subscribe-success?session_id={CHECKOUT_SESSION_ID}`,
+    //     cancel_url: `${process.env.SITE_DOMAIN}/profile`,
+    //   });
+
+    //   res.send({ url: session.url });
+    // });
+
+    //-----------------------------------
+    // Subscription APIs
+    //-----------------------------------
+
+    // Subscribe Success
+
+    app.post("/subscribe", verifyFbToken, async (req, res) => {
+      console.log("🔥 /subscribe HIT");
+
+      const email = req.decoded_email;
+      console.log("Decoded email:", email);
+
+      if (!email) {
+        console.log("❌ No email!");
+        return res.status(400).send({ message: "Email missing" });
       }
-    });
-    //-----------------------------------
-    //subscription related api
-    //-----------------------------------
-    app.post("/subscribe", async (req, res) => {
+
+      const user = await usersCollection.findOne({ email });
+      console.log("User found:", user);
+
+      if (!user) {
+        console.log("❌ User not found!");
+        return res.status(404).send({ message: "User not found" });
+      }
+
       try {
-        const email = req.body.email;
-        const user = await usersCollection.findOne({ email });
-        if (!user) return res.status(404).send({ message: "User not found" });
+        console.log("🔥 Creating Stripe Session…");
 
         const session = await stripe.checkout.sessions.create({
           payment_method_types: ["card"],
+          mode: "payment",
           line_items: [
             {
               price_data: {
                 currency: "usd",
-                unit_amount: 1000 * 100,
+                unit_amount: 1000,
                 product_data: { name: "Premium Subscription" },
               },
               quantity: 1,
             },
           ],
-          mode: "payment",
           customer_email: email,
           success_url: `${process.env.SITE_DOMAIN}/subscribe-success?session_id={CHECKOUT_SESSION_ID}`,
           cancel_url: `${process.env.SITE_DOMAIN}/profile`,
         });
 
-        res.send({ url: session.url });
+        console.log("🔥 Stripe Session Created:", session.id);
+
+        return res.send({ url: session.url });
       } catch (err) {
-        console.error("POST /subscribe error:", err);
-        res.status(500).send({ message: "Subscription failed" });
+        console.log("❌ Stripe Error:", err);
+        return res
+          .status(500)
+          .send({ message: "Stripe Error", error: err.message });
       }
     });
 
     app.get("/subscribe-success", async (req, res) => {
       try {
         const sessionId = req.query.session_id;
+
         if (!sessionId)
           return res.status(400).send({ message: "Missing session_id" });
 
         const session = await stripe.checkout.sessions.retrieve(sessionId);
+
         const email = session.customer_email;
 
-        // Update user as premium
+        if (!email)
+          return res.status(400).send({ message: "Customer email missing" });
+
         await usersCollection.updateOne(
           { email },
-          { $set: { isPremium: true, subscriptionDate: new Date() } }
+          {
+            $set: {
+              isPremium: true,
+              subscriptionDate: new Date(),
+            },
+          }
         );
+
+        // Save payment history
+        await paymentsCollection.insertOne({
+          email,
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          createdAt: new Date(),
+          sessionId,
+        });
 
         res.send({
           message: "Subscription successful",
@@ -636,40 +702,60 @@ async function run() {
         });
       } catch (err) {
         console.error("GET /subscribe-success error:", err);
-        res.status(500).send({ message: "Subscription success failed" });
+        res.status(500).send({
+          message: "Subscription success failed",
+          error: err.message,
+        });
       }
     });
 
     // ------------------------
-    // CREATE ISSUE (protected)
-    // - initializes timeline with "Issue reported by citizen"
-    // ------------------------
-    // Make sure to include the verifyFbToken middleware
+
     app.post("/issues", verifyFbToken, async (req, res) => {
       try {
-        const issue = req.body;
+        const {
+          title,
+          description,
+          category,
+          image,
+          reporterRegion,
+          reporterDistrict,
+        } = req.body;
 
-        // Set default fields
-        issue.createdAt = new Date();
-        issue.status = "Pending";
-        issue.priority = "Normal";
-        issue.upvotes = 0;
+        // ✅ Validate required fields
+        if (
+          !title ||
+          !description ||
+          !category ||
+          !reporterRegion ||
+          !reporterDistrict
+        ) {
+          return res.status(400).send({ message: "Missing required fields" });
+        }
 
-        // Use decoded_email from Firebase token
-        issue.userEmail = req.decoded_email;
-
-        // Initialize timeline
-        issue.timeline = [
-          {
-            status: "Pending",
-            message: "Issue reported by citizen",
-            updatedBy: req.decoded_email,
-            role: "Citizen",
-            date: new Date(),
-          },
-        ];
-
-        console.log("Issue reporter email:", req.decoded_email);
+        // Build issue object
+        const issue = {
+          title,
+          description,
+          category,
+          image: image || "",
+          reporterRegion,
+          reporterDistrict,
+          userEmail: req.decoded_email,
+          createdAt: new Date(),
+          status: "Pending",
+          priority: "Normal",
+          upvotes: 0,
+          timeline: [
+            {
+              status: "Pending",
+              message: "Issue reported by citizen",
+              updatedBy: req.decoded_email,
+              role: "Citizen",
+              date: new Date(),
+            },
+          ],
+        };
 
         const result = await issuesCollection.insertOne(issue);
 
@@ -685,7 +771,6 @@ async function run() {
 
     // ------------------------
     // ASSIGN STAFF (protected)
-    // - sets assignedTo and status; adds timeline entry
     // ------------------------
     app.post("/issues/:id/assign", async (req, res) => {
       try {
@@ -741,11 +826,11 @@ async function run() {
     // ------------------------
     // GET MY ISSUES (public, filters by email param)
     // ------------------------
-    app.get("/issues/my-issues/:email", async (req, res) => {
+    app.get("/issues/my-issues", verifyFbToken, async (req, res) => {
       try {
-        const email = req.params.email;
+        const email = req.decoded_email; // from token
         const issues = await issuesCollection
-          .find({ userEmail: email })
+          .find({ userEmail: email }) // match exactly with DB
           .sort({ createdAt: -1 })
           .toArray();
 
@@ -903,26 +988,26 @@ async function run() {
     app.delete("/issues/:id", verifyFbToken, async (req, res) => {
       try {
         const id = req.params.id;
-        if (!ObjectId.isValid(id))
-          return res.status(400).send({ message: "Invalid id" });
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid ID" });
+        }
 
         const issue = await issuesCollection.findOne({ _id: new ObjectId(id) });
-        if (!issue) return res.status(404).send({ message: "Issue not found" });
 
-        if (issue.status !== "Pending")
-          return res
-            .status(400)
-            .send({ message: "Only pending issues can be deleted" });
+        if (!issue) {
+          return res.status(404).send({ message: "Issue not found" });
+        }
 
-        // only the owner or admin should delete - here we check owner
+        // Only allow owner to delete
         if (issue.userEmail !== req.decoded_email) {
-          // add admin check if needed
           return res
             .status(403)
-            .send({ message: "Forbidden: only owner can delete" });
+            .send({ message: "Forbidden: only owner can delete this issue" });
         }
 
         await issuesCollection.deleteOne({ _id: new ObjectId(id) });
+
         res.status(200).send({ message: "Issue deleted successfully" });
       } catch (err) {
         console.error("DELETE /issues/:id error:", err);
@@ -936,7 +1021,7 @@ async function run() {
 
     // CREATE BOOST SESSION (protected)
     // Frontend calls this to create a Stripe checkout session.
-    app.post("/create-boost-session", async (req, res) => {
+    app.post("/create-boost-session", verifyFbToken, async (req, res) => {
       try {
         const { issueId, cost, title, userEmail } = req.body;
 
@@ -955,7 +1040,7 @@ async function run() {
           line_items: [
             {
               price_data: {
-                currency: "usd", // change currency if needed
+                currency: "usd", 
                 unit_amount: parseInt(cost, 10) * 100,
                 product_data: {
                   name: `Boost Issue: ${title}`,
@@ -983,11 +1068,25 @@ async function run() {
       }
     });
 
+    app.get("/admin/payments", verifyAdmin, async (req, res) => {
+      try {
+        const payments = await paymentsCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(payments);
+      } catch (err) {
+        console.error("GET /admin/payments error:", err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
     // BOOST SUCCESS (public)
     // Stripe will redirect the user to this endpoint (via success_url).
     // We read the session, update issue priority, insert a payment record,
     // and append a timeline entry (via helper — no duplicate push).
-    app.get("/boost-success", async (req, res) => {
+    app.get("/boost-success", verifyFbToken, async (req, res) => {
       try {
         const sessionId = req.query.session_id;
         if (!sessionId)
@@ -1052,25 +1151,68 @@ async function run() {
     });
 
     // OPTIONAL: Get payments for a user (protected)
-    app.get("/payments", async (req, res) => {
+    app.get("/payments", verifyFbToken, async (req, res) => {
       try {
-        const email = req.query.email;
-        if (!email)
-          return res.status(400).send({ message: "Missing email query param" });
-
-        // Ensure the requested email is the same as the authenticated user, or add admin override
-        if (email !== req.decoded_email) {
-          return res.status(403).send({ message: "Forbidden access" });
-        }
+        const email = req.decoded_email;
 
         const payments = await paymentsCollection
           .find({ email })
           .sort({ createdAt: -1 })
           .toArray();
+
         res.send(payments);
       } catch (err) {
         console.error("GET /payments error:", err);
         res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
+    //=======================
+    //staff related api
+    //-----------------------
+    // POST /staff-applications
+    app.post("/staff", verifyFbToken, async (req, res) => {
+      try {
+        const application = req.body;
+
+        // Required fields validation
+        const requiredFields = [
+          "name",
+          "email",
+          "phone",
+          "region",
+          "district",
+        ];
+        for (const field of requiredFields) {
+          if (!application[field]) {
+            return res.status(400).send({ message: `${field} is required` });
+          }
+        }
+
+        // Default fields
+        application.status = "Pending"; // Pending approval
+        application.submittedAt = new Date();
+        application.timeline = [
+          {
+            status: "Pending",
+            message: "Application submitted",
+            updatedBy: req.decoded_email,
+            role: "Applicant",
+            date: new Date(),
+          },
+        ];
+
+        const result = await staffCollection.insertOne(application);
+
+        res.status(201).send({
+          message: "Staff application submitted successfully",
+          insertedId: result.insertedId,
+        });
+      } catch (err) {
+        console.error("POST /staff-applications error:", err);
+        res
+          .status(500)
+          .send({ message: "Internal server error", error: err.message });
       }
     });
 
