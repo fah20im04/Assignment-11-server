@@ -535,17 +535,17 @@ async function run() {
     });
 
     // --- Add Staff Route ---
-    app.post("/admin/staff", verifyFbToken, verifyAdmin, async (req, res) => {
-      const { name, email, phone, photo, password } = req.body;
 
-      if (!name || !email || !password) {
-        return res
-          .status(400)
-          .json({ message: "Name, email, and password are required" });
-      }
+    // POST /admin/staff on the backend (Your Node.js file)
+
+    app.post("/admin/staff", verifyFbToken, verifyAdmin, async (req, res) => {
+      const { name, email, phone, photo, password, region, district } =
+        req.body;
+
+      // ... validation ...
 
       try {
-        // 1. Create user in Firebase
+        // 1. Create user in Firebase Auth (required for login)
         const userRecord = await admin.auth().createUser({
           email,
           password,
@@ -553,9 +553,7 @@ async function run() {
           photoURL: photo || null,
         });
 
-        // 2. Insert into MongoDB
-        const staff = {
-          _id: userRecord.uid,
+        const commonUserData = {
           name,
           email,
           phone: phone || "",
@@ -564,21 +562,24 @@ async function run() {
           createdAt: new Date(),
         };
 
-        await staffCollection.insertOne(staff);
+        // 2. Insert into USERS Collection
+        await usersCollection.insertOne(commonUserData);
 
-        res.status(201).json({ message: "Staff added successfully", staff });
+        // 3. Insert into STAFF Collection
+        const staffSpecific = {
+          ...commonUserData, // Re-use common fields
+          region,
+          district,
+          experience: req.body.experience || "0",
+          status: req.body.status || "Accepted",
+        };
+        await staffCollection.insertOne(staffSpecific);
+
+        res.status(201).json({ message: "Staff added successfully" });
       } catch (error) {
-        console.error("Error creating staff:", error);
-
-        // Check if email already exists in Firebase
-        if (error.code === "auth/email-already-exists") {
-          return res.status(400).json({ message: "Email already exists" });
-        }
-
-        res.status(500).json({ message: error.message });
+        // ... error handling ...
       }
     });
-
     app.post(
       "/admin/issues/:id/reject",
       verifyFbToken,
@@ -906,13 +907,54 @@ async function run() {
       }
     });
 
-    // ------------------------
-    // GET ALL ISSUES (public)
-    // ------------------------
+
     app.get("/issues", async (req, res) => {
       try {
-        const issues = await issuesCollection.find().toArray();
-        res.send(issues);
+        const { search, status, category, priority, page, limit } = req.query;
+
+        // 1. Pagination Constants
+        const pageNumber = parseInt(page) || 1;
+        const limitNumber = parseInt(limit) || 9; // Default to 9 items per page
+        const skip = (pageNumber - 1) * limitNumber;
+
+        let queryFilter = {};
+
+        // Filtering
+        if (status) {
+          queryFilter.status = status;
+        }
+        if (category) {
+          queryFilter.category = category;
+        }
+        if (priority) {
+          queryFilter.priority = priority;
+        }
+
+        if (search) {
+          const searchRegex = new RegExp(search, "i");
+          queryFilter.$or = [
+            { title: { $regex: searchRegex } },
+            { description: { $regex: searchRegex } },
+            { reporterDistrict: { $regex: searchRegex } },
+            { reporterRegion: { $regex: searchRegex } },
+          ];
+        }
+
+        const sortOptions = {
+          priority: -1,
+          createdAt: -1,
+        };
+
+        const issues = await issuesCollection
+          .find(queryFilter)
+          .sort(sortOptions)
+          .skip(skip)
+          .limit(limitNumber)
+          .toArray();
+
+        const totalIssues = await issuesCollection.countDocuments(queryFilter);
+
+        res.send({ issues, totalIssues });
       } catch (e) {
         console.error("GET /issues error:", e);
         res.status(500).send({ message: "Internal server error" });
@@ -1280,37 +1322,43 @@ async function run() {
 
     app.post("/staff", verifyFbToken, async (req, res) => {
       try {
-        const application = req.body;
+        const staffData = req.body;
 
-        // Required fields validation
         const requiredFields = ["name", "email", "phone", "region", "district"];
         for (const field of requiredFields) {
-          if (!application[field]) {
+          if (!staffData[field]) {
             return res.status(400).send({ message: `${field} is required` });
           }
         }
 
-        // Default fields
-        application.status = "Pending"; // Pending approval
-        application.submittedAt = new Date();
-        application.timeline = [
+        delete staffData._id;
+
+        if (!staffData.status) {
+          staffData.status = "Accepted";
+        }
+        if (!staffData.experience) {
+          staffData.experience = "0";
+        }
+
+        staffData.submittedAt = new Date();
+        staffData.timeline = [
           {
-            status: "Pending",
-            message: "Application submitted",
+            status: staffData.status,
+            message: "Staff member created by Admin.",
             updatedBy: req.decoded_email,
-            role: "Applicant",
+            role: "Admin",
             date: new Date(),
           },
         ];
 
-        const result = await staffCollection.insertOne(application);
+        const result = await staffCollection.insertOne(staffData);
 
         res.status(201).send({
-          message: "Staff application submitted successfully",
+          message: "Staff member added successfully",
           insertedId: result.insertedId,
         });
       } catch (err) {
-        console.error("POST /staff-applications error:", err);
+        console.error("POST /staff error:", err);
         res
           .status(500)
           .send({ message: "Internal server error", error: err.message });
