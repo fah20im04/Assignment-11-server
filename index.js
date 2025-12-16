@@ -18,7 +18,10 @@ const port = process.env.PORT || 3000;
 //  FIREBASE ADMIN INIT
 // =========================
 
-const serviceAccount = require("./civicconnet-firebase-adminsdk-fbsvc-9c71a80474.json");
+
+
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const serviceAccount = JSON.parse(decoded);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -30,7 +33,7 @@ console.log("Firebase Admin Initialized");
 //  GLOBAL MIDDLEWARES
 // =========================
 
-const FRONTEND_ORIGIN = process.env.SITE_DOMAIN || "http://localhost:5173";
+const FRONTEND_ORIGIN = process.env.SITE_DOMAIN ;
 
 app.use(
   cors({
@@ -46,13 +49,12 @@ app.use(express.json());
 // =========================
 //  VERIFY FIREBASE TOKEN MIDDLEWARE
 // =========================
-// const admin = require("firebase-admin");
 
 const verifyFbToken = async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
   if (!authHeader?.startsWith("Bearer ")) {
-    console.log("❌ Missing Authorization header");
+    console.log(" Missing Authorization header");
     return res.status(401).send({ message: "Unauthorized" });
   }
 
@@ -114,6 +116,23 @@ async function run() {
         next();
       } catch (err) {
         console.error("verifyAdmin error:", err);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    }
+    async function verifyStaff(req, res, next) {
+      try {
+        if (!req.decoded_email) {
+          return res.status(401).send({ message: "Unauthorized" });
+        }
+        const staffUser = await usersCollection.findOne({
+          email: req.decoded_email,
+        });
+        if (!staffUser || staffUser.role !== "staff") {
+          return res.status(403).send({ message: "Forbidden: staff only" });
+        }
+        next();
+      } catch (err) {
+        console.error("verifyStaff error:", err);
         res.status(500).send({ message: "Internal server error" });
       }
     }
@@ -440,7 +459,7 @@ async function run() {
         // boosted (priority: "High") first, then others, sort by createdAt desc
         const cursor = issuesCollection
           .find()
-          .sort({ priority: -1, createdAt: -1 })
+          .sort({ priority: 1, createdAt: -1 })
           .skip(skip)
           .limit(limit);
         const issues = await cursor.toArray();
@@ -522,10 +541,59 @@ async function run() {
       verifyFbToken,
       verifyAdmin,
       async (req, res) => {
-        const id = req.params.id;
+        const staffIdString = req.params.id;
         const updateData = req.body;
-        await staffCollection.updateOne({ _id: id }, { $set: updateData });
-        res.send({ message: "Staff updated successfully" });
+
+        delete updateData.email;
+        delete updateData.role;
+        delete updateData._id;
+
+        try {
+          const staffObjectId = new ObjectId(staffIdString);
+
+          const updateDoc = {
+            $set: {
+              ...updateData,
+              updatedAt: new Date(),
+            },
+          };
+
+          const staffUpdateResult = await staffCollection.updateOne(
+            { _id: staffObjectId },
+            updateDoc
+          );
+
+          const userUpdateResult = await usersCollection.updateOne(
+            { _id: staffObjectId },
+            updateDoc
+          );
+
+          if (
+            staffUpdateResult.modifiedCount === 0 &&
+            userUpdateResult.modifiedCount === 0
+          ) {
+            const matched =
+              staffUpdateResult.matchedCount > 0 ||
+              userUpdateResult.matchedCount > 0;
+            if (!matched) {
+              return res
+                .status(404)
+                .send({ message: "Staff member not found in the database." });
+            }
+
+            return res.send({
+              message: "Staff member found, but no changes were applied.",
+            });
+          }
+
+          res.send({ message: "Staff updated successfully" });
+        } catch (e) {
+          console.error("MongoDB update error:", e);
+
+          res.status(500).send({
+            message: "Failed to update staff due to a database error.",
+          });
+        }
       }
     );
 
@@ -906,7 +974,6 @@ async function run() {
           .send({ message: "Assignment failed", error: err.message });
       }
     });
-
 
     app.get("/issues", async (req, res) => {
       try {
@@ -1406,13 +1473,6 @@ async function run() {
           return res.status(404).send({ message: "Issue not found" });
         }
 
-        // Allow ACCEPT only if issue is assigned to this staff
-        // if (!issue.assignedTo || issue.assignedTo.email !== staffEmail) {
-        //   return res.status(403).send({
-        //     message: "This issue is not assigned to you",
-        //   });
-        // }
-
         const updateDoc = {
           $set: { status },
           $push: {
@@ -1485,40 +1545,44 @@ async function run() {
     });
 
     // GET /staff/issues/:email
-    app.get("/staff/issues/:email", verifyFbToken, async (req, res) => {
-      try {
-        const staffEmail = req.params.email;
+    app.get(
+      "/staff/issues/:email",
+      verifyFbToken,
+      verifyStaff,
+      async (req, res) => {
+        try {
+          const staffEmail = req.params.email;
+          if (staffEmail !== req.decoded_email) {
+            return res.status(403).send({ message: "Forbidden" });
+          }
 
-        // Only the logged-in staff can access their issues
-        if (staffEmail !== req.decoded_email) {
-          return res.status(403).send({ message: "Forbidden" });
+          // Get the staff document
+          const staff = await staffCollection.findOne({ email: staffEmail });
+          if (!staff)
+            return res.status(404).send({ message: "Staff not found" });
+
+          const staffDistrict = staff.district;
+
+          // Fetch issues:
+          // 1️⃣ Already assigned to this staff via issue.assignedTo.email
+          // 2️⃣ Pending issues in the same district
+          const issues = await issuesCollection
+            .find({
+              $or: [
+                { "assignedTo.email": staffEmail }, // already assigned
+                { reporterDistrict: staffDistrict, status: "Pending" }, // pending in same district
+              ],
+            })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          res.send(issues);
+        } catch (err) {
+          console.error("GET /staff/issues/:email error:", err);
+          res.status(500).send({ message: "Internal server error" });
         }
-
-        // Get the staff document
-        const staff = await staffCollection.findOne({ email: staffEmail });
-        if (!staff) return res.status(404).send({ message: "Staff not found" });
-
-        const staffDistrict = staff.district;
-
-        // Fetch issues:
-        // 1️⃣ Already assigned to this staff via issue.assignedTo.email
-        // 2️⃣ Pending issues in the same district
-        const issues = await issuesCollection
-          .find({
-            $or: [
-              { "assignedTo.email": staffEmail }, // already assigned
-              { reporterDistrict: staffDistrict, status: "Pending" }, // pending in same district
-            ],
-          })
-          .sort({ createdAt: -1 })
-          .toArray();
-
-        res.send(issues);
-      } catch (err) {
-        console.error("GET /staff/issues/:email error:", err);
-        res.status(500).send({ message: "Internal server error" });
       }
-    });
+    );
 
     app.get("/dashboard/staff", verifyFbToken, async (req, res) => {
       try {
@@ -1618,44 +1682,48 @@ async function run() {
       }
     });
 
-    app.get("/dashboard/staff/:email", verifyFbToken, async (req, res) => {
-      try {
-        const email = req.params.email;
+    app.get(
+      "/dashboard/staff/:email",
+      verifyFbToken,
+      verifyStaff,
+      async (req, res) => {
+        try {
+          const email = req.params.email;
 
-        // 🔐 Security check
-        if (email !== req.decoded_email) {
-          return res.status(403).send({ message: "Forbidden" });
+          if (email !== req.decoded_email) {
+            return res.status(403).send({ message: "Forbidden" });
+          }
+
+          // Assigned issues
+          const assignedIssues = await issuesCollection.countDocuments({
+            assignedTo: email,
+          });
+
+          const resolvedIssues = await issuesCollection.countDocuments({
+            assignedTo: email,
+            status: "Resolved",
+          });
+
+          // Today's tasks
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+
+          const todayTasks = await issuesCollection.countDocuments({
+            assignedTo: email,
+            updatedAt: { $gte: today },
+          });
+
+          res.send({
+            assignedIssues,
+            resolvedIssues,
+            todayTasks,
+          });
+        } catch (err) {
+          console.error("GET /dashboard/staff/:email error:", err);
+          res.status(500).send({ message: "Internal server error" });
         }
-
-        // Assigned issues
-        const assignedIssues = await issuesCollection.countDocuments({
-          assignedTo: email,
-        });
-
-        const resolvedIssues = await issuesCollection.countDocuments({
-          assignedTo: email,
-          status: "Resolved",
-        });
-
-        // Today's tasks
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-
-        const todayTasks = await issuesCollection.countDocuments({
-          assignedTo: email,
-          updatedAt: { $gte: today },
-        });
-
-        res.send({
-          assignedIssues,
-          resolvedIssues,
-          todayTasks,
-        });
-      } catch (err) {
-        console.error("GET /dashboard/staff/:email error:", err);
-        res.status(500).send({ message: "Internal server error" });
       }
-    });
+    );
 
     // End of route registrations inside run()
   } catch (err) {
