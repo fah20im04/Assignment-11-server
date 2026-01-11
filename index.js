@@ -18,9 +18,9 @@ const port = process.env.PORT || 3000;
 //  FIREBASE ADMIN INIT
 // =========================
 
-
-
-const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8')
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8"
+);
 const serviceAccount = JSON.parse(decoded);
 
 admin.initializeApp({
@@ -33,11 +33,11 @@ console.log("Firebase Admin Initialized");
 //  GLOBAL MIDDLEWARES
 // =========================
 
-const FRONTEND_ORIGIN = process.env.SITE_DOMAIN ;
+const FRONTEND_ORIGIN = process.env.SITE_DOMAIN;
 
 app.use(
   cors({
-    origin: FRONTEND_ORIGIN,
+    origin: "*",
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
