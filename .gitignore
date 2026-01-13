@@ -2,3 +2,4 @@
 node_modules
 civicconnet-firebase-adminsdk-fbsvc-9c71a80474.json
 .vercel
+.env*.local
